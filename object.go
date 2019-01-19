@@ -128,3 +128,30 @@ func createObject(header, content []byte) (string, error) {
 
 	return hash, nil
 }
+
+func getFileHash(fileName string) (string, error) {
+	fileStat, err := os.Stat(fileName)
+	if err != nil {
+		fmt.Println("file not exists")
+		return "", err
+	}
+
+	if fileStat.IsDir() {
+		fmt.Printf("%s is directory\n", fileName)
+		return "", err
+	}
+
+	header := []byte("blob " + strconv.Itoa(int(fileStat.Size())) + "\u0000")
+
+	content, err := ioutil.ReadFile(fileName)
+	if err != nil {
+		fmt.Println("file read error")
+		return "", err
+	}
+
+	h := sha1.New()
+	h.Write(append(header, content...))
+
+	hash := hex.EncodeToString(h.Sum(nil))
+	return hash, nil
+}

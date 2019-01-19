@@ -1,14 +1,20 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha1"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
-	"flag"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"os"
+	"sort"
 	"strings"
+	"syscall"
+
+	"github.com/urfave/cli"
 )
 
 type entry struct {
@@ -41,19 +47,228 @@ var (
 )
 
 func main() {
-	flag.Parse()
-	// 対象のファイルリストを取得する
-	fileList := dirwalk(".")
-	fmt.Println(fileList)
 
-	_, err := createCommitObject(fileList)
-	if err != nil {
-		panic(err)
+	app := cli.NewApp()
+	app.Commands = []cli.Command{
+		{
+			Name:    "status",
+			Aliases: []string{"s"},
+			Usage:   "show status",
+			Action: func(ctx *cli.Context) error {
+				body, _ := ioutil.ReadFile(".git/index")
+				idx, err := parseIndex(body)
+
+				fmt.Printf("%+v\n", idx)
+				return err
+			},
+		},
+		{
+			Name: "commit",
+			Action: func(ctx *cli.Context) error {
+				// 対象のファイルリストを取得する
+				fileList := dirwalk(".")
+				fmt.Println(fileList)
+
+				_, err := createCommitObject(fileList)
+				if err != nil {
+					panic(err)
+				}
+
+				body, _ := ioutil.ReadFile(".git/index")
+				idx, err := parseIndex(body)
+
+				fmt.Printf("%+v\n", idx)
+
+				updateIndex()
+
+				body, _ = ioutil.ReadFile(".git/index")
+				idx, err = parseIndex(body)
+
+				fmt.Printf("%+v\n", idx)
+				return err
+			},
+		},
+		{
+			Name: "sha",
+			Action: func(ctx *cli.Context) error {
+				if len(ctx.Args()) != 1 {
+					return errors.New("FimeName plz")
+				}
+
+				hash, err := getFileHash(ctx.Args()[0])
+				if err != nil {
+					return err
+				}
+				fmt.Println(hash)
+				return nil
+			},
+		},
+		{
+			Name: "update",
+			Action: func(ctx *cli.Context) error {
+				if err := updateIndex(); err != nil {
+					return err
+				}
+				return nil
+			},
+		},
+		{
+			Name: "index-byte",
+			Action: func(ctx *cli.Context) error {
+				body, _ := ioutil.ReadFile(".git/index")
+				fmt.Println(body)
+				return nil
+			},
+		},
 	}
-	// body, _ := ioutil.ReadFile(".git/index")
-	// idx, err := parseIndex(body)
-	// fmt.Println(err)
-	// fmt.Printf("%+v", idx)
+
+	sort.Sort(cli.FlagsByName(app.Flags))
+	sort.Sort(cli.CommandsByName(app.Commands))
+
+	err := app.Run(os.Args)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func updateIndex() error {
+	idx := &index{}
+	idx.version = 2
+
+	fileList := dirwalk(".")
+	for _, fileName := range fileList {
+		fmt.Println(fileName)
+		stat, err := os.Stat(fileName)
+		if err != nil {
+			return err
+		}
+		fileInfo, ok := stat.Sys().(*syscall.Stat_t)
+		if !ok {
+			return errors.New("cant cast")
+		}
+
+		newEntry := entry{}
+		newEntry.ctime = uint32(fileInfo.Ctimespec.Sec)
+		newEntry.ctimeNano = uint32(fileInfo.Ctimespec.Nsec)
+
+		newEntry.mTime = uint32(fileInfo.Mtimespec.Sec)
+		newEntry.mTimeNano = uint32(fileInfo.Mtimespec.Nsec)
+
+		newEntry.dev = uint32(fileInfo.Dev)
+
+		newEntry.inode = uint32(fileInfo.Ino)
+
+		newEntry.mode = stat.Mode()
+		newEntry.uid = fileInfo.Uid
+		newEntry.guid = fileInfo.Gid
+
+		newEntry.size = uint32(stat.Size())
+		hash, err := getFileHash(fileName)
+		if err != nil {
+			return err
+		}
+		newEntry.sha1 = hash
+		newEntry.assumeValid = false
+		newEntry.extendedFlag = false
+		newEntry.nameLen = uint16(len(fileName))
+		newEntry.name = fileName
+		idx.entries = append(idx.entries, newEntry)
+		idx.entryCount++
+	}
+	sort.Slice(idx.entries, func(i, j int) bool {
+		return bytes.Compare([]byte(idx.entries[i].name), []byte(idx.entries[j].name)) <= 0
+	})
+	fmt.Printf("%+v\n", idx)
+
+	buf, err := idx.getBytes()
+	if err != nil {
+		return err
+	}
+	h := sha1.New()
+	h.Write(buf.Bytes())
+
+	checkSum := h.Sum(nil)
+	buf.Write(checkSum)
+
+	fmt.Println(buf.Bytes())
+	if err := ioutil.WriteFile(gitDir+"/index", buf.Bytes(), 0644); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (idx *index) getBytes() (bytes.Buffer, error) {
+	var buf bytes.Buffer
+	buf.WriteString("DIRC")
+	versionBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(versionBytes, idx.version)
+
+	countBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(countBytes, idx.entryCount)
+
+	buf.Write(versionBytes)
+	buf.Write(countBytes)
+	for _, en := range idx.entries {
+
+		entryBuf, err := en.getBytes()
+		if err != nil {
+			return buf, err
+		}
+		buf.Write(entryBuf.Bytes())
+	}
+	return buf, nil
+}
+
+func (en *entry) getBytes() (bytes.Buffer, error) {
+	var buf bytes.Buffer
+	binary.Write(&buf, binary.BigEndian, en.ctime)
+	binary.Write(&buf, binary.BigEndian, en.ctimeNano)
+	binary.Write(&buf, binary.BigEndian, en.mTime)
+	binary.Write(&buf, binary.BigEndian, en.mTimeNano)
+	binary.Write(&buf, binary.BigEndian, en.dev)
+	binary.Write(&buf, binary.BigEndian, en.inode)
+	mode := make([]byte, 4)
+	binary.BigEndian.PutUint32(mode, uint32(en.mode))
+	mode[2] |= 0x80
+	buf.Write(mode)
+
+	binary.Write(&buf, binary.BigEndian, en.uid)
+	binary.Write(&buf, binary.BigEndian, en.guid)
+	binary.Write(&buf, binary.BigEndian, en.size)
+	sha1Bytes, err := hex.DecodeString(en.sha1)
+	if err != nil {
+		return buf, err
+	}
+	buf.Write(sha1Bytes)
+
+	flags := make([]byte, 2)
+	flags[0] |= boolToByte(en.extendedFlag) << 7
+	flags[0] |= boolToByte(en.assumeValid) << 6
+	flags[0] |= en.stage << 4
+	nameLen := make([]byte, 2)
+	binary.BigEndian.PutUint16(nameLen, en.nameLen)
+	flags[0] |= (nameLen[0] & 0x0f)
+	flags[1] = nameLen[1]
+	buf.Write(flags)
+
+	buf.WriteString(en.name)
+
+	paddingNum := 10 - (en.nameLen % 10)
+	if paddingNum == 0 {
+		paddingNum = 10
+	}
+	padding := make([]byte, paddingNum)
+	buf.Write(padding)
+
+	return buf, nil
+}
+
+func boolToByte(b bool) byte {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 func parseIndex(body []byte) (*index, error) {
@@ -124,10 +339,8 @@ func parseIndex(body []byte) (*index, error) {
 		fmt.Println("flags: ", hex.EncodeToString(flagsByte))
 		flags := binary.BigEndian.Uint16(flagsByte)
 
-		en.assumeValid = 0 != (flags & 0x4000)
-
 		en.extendedFlag = 0 != (flags & 0x8000)
-
+		en.assumeValid = 0 != (flags & 0x4000)
 		en.stage = uint8((flags & 0x3000) >> 12)
 
 		en.nameLen = flags & 0x0fff
@@ -135,11 +348,12 @@ func parseIndex(body []byte) (*index, error) {
 		name, entryBody := entryBody[:en.nameLen], entryBody[en.nameLen:]
 		fmt.Println("name: ", hex.EncodeToString(name))
 		fmt.Println("name: ", string(name))
+		fmt.Println("name length: ", en.nameLen)
 		en.name = string(name)
 
-		paddingNum := (en.nameLen % 4)
+		paddingNum := 10 - (en.nameLen % 10)
 		if paddingNum == 0 {
-			paddingNum = 4
+			paddingNum = 10
 		}
 		fmt.Println("padding num:", paddingNum)
 		padding, entryBody := entryBody[:paddingNum], entryBody[paddingNum:]
@@ -166,7 +380,7 @@ func getHeadHash() (string, error) {
 		return "", err
 	}
 	fmt.Println("head hash: ", string(buf))
-	return string(buf), nil
+	return strings.Trim(string(buf), "\n"), nil
 }
 
 func getHead() (string, error) {
