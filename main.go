@@ -1,9 +1,6 @@
 package main
 
 import (
-	"bytes"
-	"compress/zlib"
-	"crypto/sha1"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -11,9 +8,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
-	"strconv"
 	"strings"
-	"time"
 )
 
 type entry struct {
@@ -47,7 +42,14 @@ var (
 
 func main() {
 	flag.Parse()
-	createCommitObject([]string{"main.go", "readme"})
+	// 対象のファイルリストを取得する
+	fileList := dirwalk(".")
+	fmt.Println(fileList)
+
+	_, err := createCommitObject(fileList)
+	if err != nil {
+		panic(err)
+	}
 	// body, _ := ioutil.ReadFile(".git/index")
 	// idx, err := parseIndex(body)
 	// fmt.Println(err)
@@ -151,133 +153,32 @@ func parseIndex(body []byte) (*index, error) {
 	return idx, nil
 }
 
-func createBlobObject(fileName string) (string, error) {
-	fileStat, err := os.Stat(fileName)
-	if err != nil {
-		fmt.Println("file not exists")
-		return "", err
-	}
-
-	if fileStat.IsDir() {
-		fmt.Printf("%s is directory\n", fileName)
-		return "", err
-	}
-
-	header := []byte("blob " + strconv.Itoa(int(fileStat.Size())) + "\u0000")
-
-	content, err := ioutil.ReadFile(fileName)
-	if err != nil {
-		fmt.Println("file read error")
-		return "", err
-	}
-	hash, err := createObject(header, content)
-	fmt.Println("blob: ", hash)
-	return hash, err
-}
-
-func createTreeObject(fileNames []string) (string, error) {
-	content := bytes.Buffer{}
-	for _, fileName := range fileNames {
-		hash, err := createBlobObject(fileName)
-		if err != nil {
-			return "", err
-		}
-
-		fileInfo, _ := os.Stat(fileName)
-
-		content.WriteString("100")
-		content.WriteString(getPermission(fileInfo.Mode()))
-		content.WriteString(" ")
-		content.WriteString(fileName)
-		content.WriteString("\u0000")
-		data, _ := hex.DecodeString(hash)
-		content.Write(data)
-	}
-	header := []byte("tree " + strconv.Itoa(len(content.String())) + "\u0000")
-
-	hash, err := createObject(header, content.Bytes())
-	fmt.Println("tree: ", hash)
-	return hash, err
-}
-
-func createCommitObject(fileNames []string) (string, error) {
-	content := bytes.Buffer{}
-
-	hash, err := createTreeObject(fileNames)
-	if err != nil {
-		return "", err
-	}
-
-	content.WriteString("tree ")
-	content.WriteString(hash)
-	content.WriteString("\n")
-	content.WriteString("author to-hutohu <tohu.soy@gmail.com> ")
-	content.WriteString(strconv.FormatInt(time.Now().Unix(), 10))
-	content.WriteString(" +0900\n")
-	content.WriteString("committer to-hutohu <tohu.soy@gmail.com> ")
-	content.WriteString(strconv.FormatInt(time.Now().Unix(), 10))
-	content.WriteString(" +0900\n\n")
-	content.WriteString("commited!!!!!")
-
-	header := []byte("commit " + strconv.Itoa(len(content.String())) + "\u0000")
-	hash, err = createObject(header, content.Bytes())
-	fmt.Println("commit: ", hash)
-	return hash, err
-}
-
-func createObject(header, content []byte) (string, error) {
-	h := sha1.New()
-	h.Write(append(header, content...))
-
-	hash := hex.EncodeToString(h.Sum(nil))
-
-	objectsDir := gitDir + "/objects/"
-
-	dirName := objectsDir + hash[:2] + "/"
-	objName := dirName + hash[2:]
-
-	os.MkdirAll(dirName, 0766)
-
-	file, err := os.Create(objName)
-	if err != nil {
-		fmt.Println("file create error")
-		return "", err
-	}
-	defer file.Close()
-	var s bytes.Buffer
-
-	z, _ := zlib.NewWriterLevel(&s, 9)
-	z.Write(append(header, content...))
-	z.Flush()
-	z.Close()
-	file.Write(s.Bytes())
-
-	return hash, nil
-}
-
-func getPermission(m os.FileMode) string {
-	num := uint32(m)
-	p1 := strconv.Itoa(int((num & 448) >> 6))
-	p2 := strconv.Itoa(int((num & 56) >> 3))
-	p3 := strconv.Itoa(int((num & 7)))
-	return p1 + p2 + p3
-}
-
 func getHeadHash() (string, error) {
 	head, err := getHead()
 	if err != nil {
 		return "", err
 	}
-
+	if isHash(head) {
+		return head, nil
+	}
+	buf, err := ioutil.ReadFile(gitDir + "/" + head)
+	if err != nil {
+		return "", err
+	}
+	fmt.Println("head hash: ", string(buf))
+	return string(buf), nil
 }
 
 func getHead() (string, error) {
 	byteBody, err := ioutil.ReadFile(gitDir + "/HEAD")
+	if err != nil {
+		return "", err
+	}
 	body := string(byteBody)
 	ref := strings.Split(body, " ")
 	if len(ref) != 2 {
 		return "", errors.New("HEAD File is invalid")
 	}
 
-	return ref[1], nil
+	return strings.Trim(ref[1], "\n"), nil
 }
